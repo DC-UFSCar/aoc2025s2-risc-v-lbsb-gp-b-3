@@ -1,33 +1,66 @@
 module riscvmulti (
-    input 	      clk,
-    input 	      reset,
+    input         clk,
+    input         reset,
     output [31:0] Address, 
     output [31:0] WriteData,
-    output 	      MemWrite,
+    output        MemWrite,
     input  [31:0] ReadData,
     output  [3:0] WriteMask, 
     output logic  halt = 0); 
 
     logic [31:0] instr, PC = 0;
 
-    wire writeBackEn = // Quando se escreve no banco de registradores?
-    wire [31:0] writeBackData = // O que se escreve no banco de registradores?
-    wire [31:0] LoadStoreAddress = // Como se calcula o endereço de memória para loads e stores?
-    assign Address = // Qual o endereço de memória a ser acessado? Alternar entre .text e .data dependendo do estado
-    assign MemWrite = // Em que estado se escreve na memória?
-    assign WriteData = // O que se escreve na memória?
+    // --- Lógica Auxiliar (Definida abaixo, mas usada aqui) ---
+    // Precisamos processar o dado lido da memória (para lb/lh) e gerar a máscara (para sb/sh)
+    logic [31:0] LoadedDataProcessed; 
+    logic [3:0]  GenWriteMask;
+
+    // --- Respostas do exercício ---
+
+    // 1. Quando escreve no registro? 
+    // No estado EXECUTE (para ALUs/Jumps/LUI) ou WAIT_DATA (para Loads).
+    // Note: Branches e Stores não escrevem em rd.
+    wire writeBackEn = ((state == EXECUTE) && (isALUreg || isALUimm || isJAL || isJALR || isLUI || isAUIPC)) || (state == WAIT_DATA);
+
+    // 2. O que escreve no registro?
+    // Se for Load, usa o dado processado (byte/half). Se JAL/JALR, PC+4. Se LUI, Uimm. Senão, resultado da ALU.
+    wire [31:0] writeBackData = (state == WAIT_DATA) ? LoadedDataProcessed : 
+                                (isJAL || isJALR)    ? PCplus4 : 
+                                (isLUI)              ? Uimm :
+                                (isAUIPC)            ? PCTarget : ALUResult;
+
+    // 3. Endereço de Load/Store: rs1 + offset (Simm para Store, Iimm para Load)
+    wire [31:0] LoadStoreAddress = rs1 + (isStore ? Simm : Iimm);
+
+    // 4. Endereço da Memória: PC (busca instrução) ou Endereço calculado (dados)
+    assign Address = (state == FETCH_INSTR || state == WAIT_INSTR) ? PC : LoadStoreAddress;
+
+    // 5. Escrita na memória apenas no estado STORE
+    assign MemWrite = (state == STORE);
+
+    // 6. Dado para escrever na memória:
+    // O dado (rs2) precisa ser deslocado para a posição correta do byte (alinhamento).
+    // Ex: sb t0, 1(a0) -> byte t0 vai para bits [15:8] da palavra.
+    assign WriteData = rs2 << (LoadStoreAddress[1:0] * 8);
+
+    // Máscara de escrita conectada à saída
+    assign WriteMask = GenWriteMask;
+
+    // ---------------------------------------------------------
+    // O RESTANTE DO CÓDIGO PERMANECE, MAS COM ADIÇÕES ABAIXO
+    // ---------------------------------------------------------
 
     // The 10 RISC-V instructions
-    wire isALUreg  =  (instr[6:0] == 7'b0110011); // rd <- rs1 OP rs2   
-    wire isALUimm  =  (instr[6:0] == 7'b0010011); // rd <- rs1 OP Iimm
-    wire isBranch  =  (instr[6:0] == 7'b1100011); // if(rs1 OP rs2) PC<-PC+Bimm
-    wire isJALR    =  (instr[6:0] == 7'b1100111); // rd <- PC+4; PC<-rs1+Iimm
-    wire isJAL     =  (instr[6:0] == 7'b1101111); // rd <- PC+4; PC<-PC+Jimm
-    wire isAUIPC   =  (instr[6:0] == 7'b0010111); // rd <- PC + Uimm
-    wire isLUI     =  (instr[6:0] == 7'b0110111); // rd <- Uimm   
-    wire isLoad    =  (instr[6:0] == 7'b0000011); // rd <- mem[rs1+Iimm]
-    wire isStore   =  (instr[6:0] == 7'b0100011); // mem[rs1+Simm] <- rs2
-    wire isSYSTEM  =  (instr[6:0] == 7'b1110011); // special
+    wire isALUreg  =  (instr[6:0] == 7'b0110011); 
+    wire isALUimm  =  (instr[6:0] == 7'b0010011); 
+    wire isBranch  =  (instr[6:0] == 7'b1100011); 
+    wire isJALR    =  (instr[6:0] == 7'b1100111); 
+    wire isJAL     =  (instr[6:0] == 7'b1101111); 
+    wire isAUIPC   =  (instr[6:0] == 7'b0010111); 
+    wire isLUI     =  (instr[6:0] == 7'b0110111);    
+    wire isLoad    =  (instr[6:0] == 7'b0000011); 
+    wire isStore   =  (instr[6:0] == 7'b0100011); 
+    wire isSYSTEM  =  (instr[6:0] == 7'b1110011); 
     wire isEBREAK  =  (isSYSTEM && (instr[14:12] == 3'b000));
 
     // The 5 immediate formats
@@ -48,26 +81,20 @@ module riscvmulti (
 
     // The registers bank
     reg [31:0] RegisterBank [0:31];
-    reg [31:0] rs1; // value of source
-    reg [31:0] rs2; //  registers.
+    reg [31:0] rs1; 
+    reg [31:0] rs2; 
 
     // The ALU
     wire [31:0] SrcA = rs1;
     wire [31:0] SrcB = isALUreg | isBranch ? rs2 : Iimm;
-    wire [ 4:0] shamt  = isALUreg ? rs2[4:0] : instr[24:20]; // shift amount
+    wire [ 4:0] shamt  = isALUreg ? rs2[4:0] : instr[24:20]; 
 
-    // The adder is used by both arithmetic instructions and JALR.
     wire [31:0] aluPlus = SrcA + SrcB;
-
-    // Use a single 33 bits subtract to do subtraction and all comparisons
-    // (trick borrowed from swapforth/J1)
     wire [32:0] aluMinus = {1'b1, ~SrcB} + {1'b0,SrcA} + 33'b1;
     wire        LT  = (SrcA[31] ^ SrcB[31]) ? SrcA[31] : aluMinus[32];
     wire        LTU = aluMinus[32];
     wire        EQ  = (aluMinus[31:0] == 0);
 
-    // Flip a 32 bit word. Used by the shifter (a single shifter for
-    // left and right shifts, saves silicium !)
     function [31:0] flip32;
         input [31:0] x;
         flip32 = {x[ 0], x[ 1], x[ 2], x[ 3], x[ 4], x[ 5], x[ 6], x[ 7], 
@@ -80,13 +107,6 @@ module riscvmulti (
     wire [31:0] shifter = $signed({instr[30] & SrcA[31], shifter_in}) >>> SrcB[4:0];
     wire [31:0] leftshift = flip32(shifter);
 
-    // ADD/SUB/ADDI: 
-    // funct7[5] is 1 for SUB and 0 for ADD. We need also to test instr[5]
-    // to make the difference with ADDI
-    //
-    // SRLI/SRAI/SRL/SRA: 
-    // funct7[5] is 1 for arithmetic shift (SRA/SRAI) and 
-    // 0 for logical shift (SRL/SRLI)
     reg [31:0]  ALUResult;
     always @(*) begin
         case(funct3)
@@ -97,11 +117,46 @@ module riscvmulti (
             3'b100: ALUResult = (SrcA ^ SrcB);
             3'b101: ALUResult = shifter;
             3'b110: ALUResult = (SrcA | SrcB);
-            3'b111: ALUResult = (SrcA & SrcB);	
+            3'b111: ALUResult = (SrcA & SrcB);  
         endcase
     end
 
-    // The predicate for branch instructions
+    // --- NOVA LÓGICA: LOAD DATA PROCESSING (lb, lh, lw, lbu, lhu) ---
+    // Precisamos deslocar o dado lido para a direita baseado nos 2 bits do endereço
+    // e depois fazer a extensão de sinal ou zero.
+    wire [1:0] addrOffset = LoadStoreAddress[1:0];
+    wire [31:0] loadedShifted = ReadData >> (addrOffset * 8); // Desloca bytes
+
+    always @(*) begin
+        if (isLoad) begin
+            case(funct3)
+                3'b000: LoadedDataProcessed = {{24{loadedShifted[7]}}, loadedShifted[7:0]};   // lb (sign-extend)
+                3'b001: LoadedDataProcessed = {{16{loadedShifted[15]}}, loadedShifted[15:0]}; // lh (sign-extend)
+                3'b010: LoadedDataProcessed = loadedShifted;                                  // lw
+                3'b100: LoadedDataProcessed = {24'b0, loadedShifted[7:0]};                    // lbu (zero-extend)
+                3'b101: LoadedDataProcessed = {16'b0, loadedShifted[15:0]};                   // lhu (zero-extend)
+                default: LoadedDataProcessed = loadedShifted;
+            endcase
+        end else begin
+            LoadedDataProcessed = 32'b0;
+        end
+    end
+
+    // --- NOVA LÓGICA: STORE MASK GENERATION (sb, sh, sw) ---
+    // Gera a máscara de 4 bits baseada no endereço e no tamanho (funct3)
+    always @(*) begin
+        if (isStore) begin
+            case(funct3) // funct3 define sb, sh, sw
+                3'b000: GenWriteMask = 4'b0001 << addrOffset; // sb
+                3'b001: GenWriteMask = 4'b0011 << addrOffset; // sh
+                3'b010: GenWriteMask = 4'b1111;               // sw
+                default: GenWriteMask = 4'b0000;
+            endcase
+        end else begin
+            GenWriteMask = 4'b0000; // Não escreve se não for store
+        end
+    end
+
     reg takeBranch;
     always @(*) begin
         case(funct3)
@@ -115,15 +170,11 @@ module riscvmulti (
         endcase
     end
 
-    // Address computation
-    // An adder used to compute branch address, JAL address and AUIPC.
-    // branch->PC+Bimm    AUIPC->PC+Uimm    JAL->PC+Jimm
     wire [31:0] PCplus4  = PC + 4;
     wire [31:0] PCTarget = PC + (isJAL ? Jimm : isAUIPC ? Uimm : Bimm);
     wire [31:0] PCNext = ((isBranch && takeBranch) || isJAL) ? PCTarget :
                                                       isJALR ? {aluPlus[31:1],1'b0} :
                                                                PCplus4;
-
 
     // The state machine
     localparam FETCH_INSTR = 0;
@@ -141,8 +192,9 @@ module riscvmulti (
             state <= FETCH_INSTR;
         end else begin
             if (writeBackEn) begin
+                // Apenas debug:
+                //$display("PC=%h WRITE r%0d <= %h", PC, rdId_A3, writeBackData);
                 RegisterBank[rdId_A3] <= writeBackData;
-                //$display("r%0d <= %b (%d) (%d)",rdId_A3,writeBackData,writeBackData,$signed(writeBackData));
             end
             case(state)
                 FETCH_INSTR: begin
@@ -162,7 +214,7 @@ module riscvmulti (
                         PC <= PCNext;
                     else
                         if (isEBREAK) begin
-                            PC <= PC; // halt
+                            PC <= PC; 
                             halt <= 1;
                         end
                     state <= isLoad  ? LOAD  : 
@@ -184,6 +236,8 @@ module riscvmulti (
     always @(posedge clk) begin
         if (halt) begin
             $writememh("regs.out", RegisterBank);
+            // Dump de memória opcional para verificar o framebuffer
+            // $writememh("mem_dump.out", mem.RAM); 
             #10 $finish();
         end
     end
